@@ -19,6 +19,7 @@ from django.db import transaction
 from django.utils import timezone
 import requests
 
+from plugins.imports import models
 from core import files
 from core import models as core_models
 from core.models import Account
@@ -72,6 +73,7 @@ def import_jats_article(
     meta["authors"] = []
     meta["date_submitted"] = None
     meta["date_accepted"] = None
+    meta["custom_how_to_cite"] = get_custom_how_to_cite(metadata_soup)
     try:
         meta["first_page"] = int(metadata_soup.find("fpage").text)
     except (ValueError, AttributeError):
@@ -87,7 +89,7 @@ def import_jats_article(
         meta["date_accepted"] = get_jats_acc_date(history_soup)
 
     authors_soup = metadata_soup.find("contrib-group")
-    author_notes = metadata_soup.find("author_notes")
+    author_notes = metadata_soup.find("author-notes")
     if authors_soup:
         meta["authors"] = get_jats_authors(
             authors_soup,
@@ -149,7 +151,6 @@ def import_jats_zipped(zip_file, journal=None, owner=None, persist=True, stage=N
                         else:
                             supplements.append(file_path)
 
-
                     if jats_path:
                         # Check nested dirs relative to xml like ./figures
                         for dir_ in dirs:
@@ -172,7 +173,7 @@ def import_jats_zipped(zip_file, journal=None, owner=None, persist=True, stage=N
                 except Exception as err:
                     logger.warning(err)
                     logger.warning(traceback.format_exc())
-                    errors.append((filenames, err))
+                    errors.append((jats_path, err))
 
     return articles, errors
 
@@ -219,7 +220,7 @@ def get_jats_title(soup):
 def get_jats_abstract(soup):
     abstract = soup.find("abstract")
     if abstract:
-        return abstract.text
+        return f"<p>{abstract.text}</p>"
     else:
         return ""
 
@@ -294,13 +295,15 @@ def get_jats_acc_date(soup):
 
 def get_jats_keywords(soup):
     jats_keywords_soup = soup.find("kwd-group")
+
+    # This was previously a set but is now a list to preserve keyword order.
     if jats_keywords_soup:
-        return {
+        return [
             keyword.text.strip()
             for keyword in jats_keywords_soup.find_all("kwd")
-        }
+        ]
     else:
-        return set()
+        return list()
 
 
 def get_jats_section_name(soup):
@@ -350,8 +353,43 @@ def get_jats_authors(soup, metadata_soup, author_notes=None):
                 corresp_email = author_notes.find("email")
                 if corresp_email:
                     author_data["email"] = corresp_email.text
+
+            else:
+                # Check and alternative route for identifying corresp
+                # authors
+                corresp_ref = author.find(
+                    'xref', {'ref-type': 'corresp'}
+                )
+                if corresp_ref:
+                    author_data["correspondence"] = True
+
+                    if author_notes:
+                        xref_rid = corresp_ref.get('rid')
+                        corr_note = author_notes.find(
+                            'corresp', {'id': xref_rid}
+                        )
+                        if corr_note:
+                            corresp_email = corr_note.find(
+                                'email'
+                            )
+                            if corresp_email:
+                                author_data["email"] = corresp_email.text
+
             authors.append(author_data)
     return authors
+
+
+def get_custom_how_to_cite(metadata_soup):
+    custom_meta_tags = metadata_soup.find_all('custom-meta')
+    for custom_meta_tag in custom_meta_tags:
+        meta_name_tag = custom_meta_tag.find('meta-name')
+        if meta_name_tag:
+            meta_name_value = meta_name_tag.string
+            if meta_name_value in ['How to cite', 'How To Cite']:
+                meta_value_tag = custom_meta_tag.find('meta-value')
+                if meta_value_tag:
+                    return meta_value_tag.text
+    return ''
 
 
 def get_orcid(author_soup):
@@ -388,12 +426,19 @@ def save_article(metadata, journal=None, issue=None, owner=None, stage=None):
         journal = get_lost_found_journal()
 
     with transaction.atomic():
-        section, _ = submission_models.Section.objects \
-            .get_or_create(
-                journal=journal,
-                name=metadata["section_name"],
-        )
-        section.save()
+        try:
+            section_map = models.SectionMap.objects.get(
+                article_type=metadata["section_name"],
+                section__journal=journal,
+            )
+            if section_map:
+                section = section_map.section
+        except models.SectionMap.DoesNotExist:
+            section, _ = submission_models.Section.objects \
+                .get_or_create(
+                    journal=journal,
+                    name=metadata["section_name"],
+            )
 
         article = get_article(metadata.get("identifiers", {}), journal)
         if not article:
@@ -409,7 +454,9 @@ def save_article(metadata, journal=None, issue=None, owner=None, stage=None):
                 is_import=True,
                 owner=owner,
                 first_page=metadata["first_page"],
-                last_page=metadata["last_page"]
+                last_page=metadata["last_page"],
+                custom_how_to_cite=metadata['custom_how_to_cite'],
+                article_agreement='This article is a JATS import.',
             )
             article.section = section
             article.save()
@@ -424,6 +471,7 @@ def save_article(metadata, journal=None, issue=None, owner=None, stage=None):
             article.rights = metadata["rights"]
             article.first_page = metadata["first_page"]
             article.last_page = metadata["last_page"]
+            article.custom_how_to_cite = metadata["custom_how_to_cite"]
             article.save()
 
         if metadata["identifiers"]["doi"]:
@@ -509,6 +557,13 @@ def save_article(metadata, journal=None, issue=None, owner=None, stage=None):
                     "issue_type": issue_type,
                     "doi": metadata["issue_doi"],
                     "date": article.date_published,
+                }
+            )
+            journal_models.SectionOrdering.objects.update_or_create(
+                issue=issue,
+                section=section,
+                defaults={
+                    "order": 0,
                 }
             )
         issue.articles.add(article)
@@ -725,7 +780,7 @@ def import_jats_preprint(
     meta["license_url"], meta["license_text"] = get_jats_license(jats_soup)
     meta["authors"] = []
     authors_soup = metadata_soup.find("contrib-group")
-    author_notes = metadata_soup.find("author_notes")
+    author_notes = jats_soup.find("author-notes")
     if authors_soup:
         meta["authors"] = get_jats_authors(
             authors_soup,
@@ -861,7 +916,7 @@ def save_preprint(
         return preprint
 
 
-def import_html_reviews(preprint, review_files, owner):
+def import_html_reviews(preprint, review_files, owner, number=None):
     review_round, _ = review_models.ReviewRound.objects.get_or_create(
         round_number=1,
         article=preprint.article,
@@ -870,6 +925,7 @@ def import_html_reviews(preprint, review_files, owner):
         journal=preprint.article.journal,
     ).first()
     for review_file in review_files:
+        print(f"Importing {review_file}")
         with open(review_file, 'r') as r_file:
             contents = r_file.read()
             try:
@@ -902,7 +958,7 @@ def import_html_reviews(preprint, review_files, owner):
                 assignment=review_assignment,
                 original_element=default_element,
                 defaults={
-                    'answer': contents.strip().replace('\n', ''),
+                    'answer': answer,
                     'author_can_see': True,
                 }
             )
